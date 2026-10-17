@@ -1,0 +1,262 @@
+---
+title: "従業員離職の生存時間解析"
+subtitle: "カプランマイヤー曲線・ログランク検定・Cox回帰・Brier Score"
+author: "Kentaro"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# 概要
+
+Kaggleの **Employee Turnover** データを用いて、従業員の離職までの時間(生存時間)を分析します。
+
+| 手法 | 目的 |
+|---|---|
+| カプランマイヤー曲線 | グループ別の生存率(在籍継続率)の推移を可視化 |
+| ログランク検定 | グループ間で生存曲線に差があるかを検定 |
+| Cox比例ハザード回帰 | 複数の説明変数を同時に考慮したハザード比の推定 |
+| 比例ハザード性の確認 | Cox回帰の前提条件の診断 |
+| Brier Score / IBS | 予測性能の評価 |
+
+**主な変数**
+
+- `stag`: 在籍期間(観察時間)
+- `event`: 離職イベント(1 = 離職、0 = 打ち切り)
+- `greywage`: 給与の形態(グレーな賃金かどうか)
+- `age`, `gender`, `selfcontrol`: 説明変数
+
+---
+
+# ライブラリの読み込み
+
+`pacman::p_load()` を使うと、未インストールのパッケージを自動でインストールしてから読み込めます。
+
+> 元のコードでは `survivminer` と記載されていましたが、正しいパッケージ名は **`survminer`** です。また、後続のコードで使用する `forestmodel`(フォレストプロット)、`dplyr`(`%>%`・`select`・`filter`)、`zoo`(移動平均)を追加しています。
+
+```{r libraries}
+pacman::p_load(
+  "RKaggle",       # Kaggleデータの取得
+  "ggplot2",       # 可視化
+  "dplyr",         # データ操作・パイプ
+  "survival",      # 生存時間解析の基本パッケージ
+  "survminer",     # 生存曲線・診断プロットの描画
+  "ggsurvfit",     # ggplot2ベースの生存曲線
+  "knitr",         # レポート生成
+  "riskRegression",# Score() によるBrier Score算出
+  "ggfortify",     # autoplot() による生存曲線の描画
+  "forestmodel",   # Cox回帰のフォレストプロット
+  "zoo"            # rollmean (IBS計算で使用)
+)
+```
+
+---
+
+# データの読み込み
+
+`RKaggle::get_dataset()` でKaggleからデータセットを取得します。
+
+```{r load-data}
+df <- RKaggle::get_dataset("davinwijaya/employee-turnover")
+df
+```
+
+---
+
+# 探索的データ分析 (EDA)
+
+まず `summary()` で各変数の基本統計量(最小値・中央値・平均・最大値など)を確認します。
+
+```{r eda}
+df |> summary()
+```
+
+---
+
+# カプランマイヤー曲線
+
+`survfit()` で `greywage` 別の生存関数を推定します。  
+`Surv(time, event)` が生存時間オブジェクトで、`~ greywage` によりグループ別に推定されます。
+
+```{r km-fit}
+survfited <- survfit(
+  Surv(time = stag, event = event) ~ greywage,
+  data = df
+)
+```
+
+## `autoplot()` による描画
+
+`ggfortify` の `autoplot()` を使った描画です。シンプルで見やすいのが特長です。
+
+```{r km-autoplot}
+autoplot(survfited, ylab = "生存率")
+```
+
+## `ggsurvfit()` による描画
+
+`ggsurvfit` パッケージによる描画です。`ggplot2` の記法で拡張しやすい形式です。
+
+```{r km-ggsurvfit}
+ggsurvfit(survfited)
+```
+
+---
+
+# ログランク検定
+
+`survminer::ggsurvplot()` を使うと、生存曲線・ログランク検定のp値・リスク集合表を1つの図にまとめられます。
+
+```{r logrank, fig.height=7}
+survminer::ggsurvplot(
+  survfited,
+  data = df,                    # 作成に用いたデータを再度指定
+  conf.int = FALSE,             # KM推定値の信頼区間を非表示
+  surv.scale = "percent",       # y軸の確率を%で表示
+  break.time.by = 10,           # x軸の時間を10単位刻みで表示
+  xlab = "Follow-up days",
+  ylab = "Survival Probability",
+  pval = TRUE,                  # ログランク検定のp値を表示
+  pval.coord = c(40, .91),      # p値の表示位置を座標で指定
+  risk.table = TRUE,            # 下にリスク集合の表を表示
+  legend.title = "greywage",    # 凡例のタイトル
+  # legend.labs = c("Female", "Male"),
+  font.legend = 10,
+  palette = "Dark2",            # カラーパレットの指定
+  surv.median.line = "hv",      # 生存時間中央値の位置に縦横の補助線を描画
+  ggtheme = theme_light()       # シンプルなテーマを使用
+)
+```
+
+---
+
+# Cox比例ハザード回帰
+
+## モデルの当てはめ
+
+`greywage`、`age`、`gender`、`selfcontrol` を説明変数としてCox回帰モデルを当てはめます。  
+`x = TRUE, y = TRUE` は説明変数と目的変数の値をモデルオブジェクトに保存する指定で、後段の `Score()` で必要になります。
+
+```{r cox-fit}
+cox_reg <- survival::coxph(
+  Surv(stag, event) ~ greywage + age + gender + selfcontrol,
+  x = TRUE, y = TRUE,
+  data = df
+)
+
+# 当てはめ結果の表示
+cox_reg
+```
+
+## フォレストプロット
+
+各変数のハザード比(HR)と95%信頼区間を図示します。HRが1より大きければ離職リスクが高いことを意味します。
+
+```{r cox-forest}
+forest_model(cox_reg)
+```
+
+## 比例ハザード性の確認
+
+Cox回帰は「ハザード比が時間によらず一定」という**比例ハザード性**を仮定します。  
+`cox.zph()` はSchoenfeld残差を用いた検定で、p値が小さい場合は仮定の違反が疑われます。プロット上の曲線がほぼ水平であれば仮定は概ね妥当です。
+
+```{r cox-zph, fig.height=7}
+test_ph <- survival::cox.zph(cox_reg)
+test_ph
+
+survminer::ggcoxzph(test_ph)
+```
+
+---
+
+# モデル性能の評価(Brier Score)
+
+## 時点ごとのBrier Score
+
+Brier Scoreは予測された生存確率と実際の結果との二乗誤差で、**小さいほど予測精度が高い**ことを示します。  
+`Score()` では、説明変数なしの `Null model` と比較できます。
+
+```{r brier}
+cox.test.brier <- Score(
+  list("cox model" = cox_reg),
+  formula = Surv(stag, event) ~ 1,
+  data = df,
+  metrics = "brier",
+  times = sort(unique(df$stag))
+)
+
+cox.test.brier$Brier$score %>%
+  select(model, times, Brier) %>%
+  ggplot(aes(x = times, y = Brier, color = model)) +
+  geom_line() +
+  xlab("Time") +
+  theme_minimal() +
+  scale_colour_manual(values = c("darkgrey", "orange")) +
+  ggtitle("Brier Score for the Cox Model")
+```
+
+## Integrated Brier Score (IBS)
+
+Brier Scoreの時間方向の曲線下面積(台形近似)を観察期間の最大値で割った、**全期間を通した平均的な予測誤差**です。  
+複数モデルを1つの数値で比較したいときに便利です。
+
+```{r ibs}
+IBrierScore <- function(brier_score, model_name) {
+
+  # 指定モデルのBrier Scoreを抽出
+  brier_score.data <- brier_score$Brier$score %>%
+    select("model", "times", "Brier") %>%
+    filter(model == model_name) %>%
+    select("times", "Brier")
+
+  x  <- brier_score.data$times
+  y  <- brier_score.data$Brier
+  id <- order(x)
+
+  # 曲線下面積(台形則)
+  area <- sum(diff(x[id]) * zoo::rollmean(y[id], 2))
+
+  # 最大時点で割って平均化
+  return(area / x[length(x)])
+}
+
+coxIBS <- IBrierScore(cox.test.brier, "cox model")
+coxIBS
+```
+
+---
+
+# Survival Forest
+
+(元のスクリプトでは見出しのみで未実装です。)  
+`randomForestSRC::rfsrc()` や `ranger::ranger()` などでランダムサバイバルフォレストを当てはめ、上記Cox回帰とBrier Score / IBSで比較する流れが考えられます。
+
+```{r survival-forest, eval=FALSE}
+# ここにsurvival forestのコードを追加
+```
+
+---
+
+# セッション情報
+
+```{r session-info}
+sessionInfo()
+```
